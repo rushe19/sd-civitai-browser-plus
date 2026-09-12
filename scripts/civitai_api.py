@@ -124,6 +124,51 @@ def normalize_sha256(sha256_hash):
         return None
     return sha256_hash.strip().upper()
 
+def thumbnail_format():
+    """Return 'webp' or 'png' from settings."""
+    fmt = getattr(opts, 'civitai_thumbnail_format', 'webp')
+    return 'png' if fmt == 'png' else 'webp'
+
+def apply_thumbnail_format(url, width=None):
+    """Rewrite CivitAI CDN image URLs to webp (light) or png (original).
+
+    Real API URLs look like:
+      .../{uuid}/original=true/{id}.jpeg
+    or .../{uuid}/width=450/... — not always with width=.
+    """
+    if not url or 'image.civitai.com' not in url:
+        return url
+    if 'transcode=true' in url or url.rstrip('/').endswith('.mp4'):
+        return url
+
+    fmt = thumbnail_format()
+    flags = {'original': 'true'} if fmt == 'png' else {'original': 'false', 'optimized': 'true'}
+
+    # filename is always the last segment
+    base, filename = url.rsplit('/', 1)
+    filename = filename.split('?', 1)[0]
+
+    # drop existing options segment (contains '=')
+    parent, last = base.rsplit('/', 1)
+    if '=' in last:
+        base = parent
+        if width is None:
+            wm = re.search(r'width=(\d+)', last)
+            if wm:
+                width = wm.group(1)
+
+    if width is None and fmt == 'webp' and getattr(opts, 'resize_preview_cards', True):
+        width = getattr(opts, 'resize_preview_size', 512)
+
+    parts = []
+    if width not in (None, ''):
+        parts.append(f'width={width}')
+    parts.extend(f'{k}={v}' for k, v in flags.items())
+    filename = re.sub(r'\.(jpe?g|png|webp)$', f'.{fmt}', filename, flags=re.I)
+    if not re.search(r'\.(jpe?g|png|webp)$', filename, flags=re.I):
+        filename = f'{filename}.{fmt}'
+    return f"{base}/{','.join(parts)}/{filename}"
+
 def safe_json_load(file_path):
     """Safely load JSON file with error handling"""
     if not os.path.exists(file_path):
@@ -297,8 +342,9 @@ def model_list_html(json_data):
             resize_size = getattr(opts, 'resize_preview_size', 512)
 
             if resize_preview and media_type == 'image':
-                # For images, modify the URL to request specific size
-                image_url = re.sub(r'/width=\d+', f"/width={resize_size}", image_url)
+                image_url = apply_thumbnail_format(image_url, width=resize_size)
+            elif media_type == 'image':
+                image_url = apply_thumbnail_format(image_url)
 
             if media_type == 'video':
                 if resize_preview:
@@ -1167,7 +1213,7 @@ def update_model_info(model_string=None, model_version=None, only_html=False, in
                     for idx, pic in enumerate(api_version['images']):
                         index = f"preview_{idx}" if from_preview else idx
                         prompt_dict = pic.get('meta', {}) or {}
-                        image_url = re.sub(r'/width=\d+', f"/width={pic.get('width', '')}", pic['url'])
+                        image_url = pic['url']
                         is_video = pic.get('type') == 'video'
 
                         img_html += (
@@ -1176,6 +1222,7 @@ def update_model_info(model_string=None, model_version=None, only_html=False, in
                         )
 
                         if is_video:
+                            image_url = re.sub(r'/width=\d+', f"/width={pic.get('width', '')}", image_url)
                             video_url = image_url.replace('width=', 'transcode=true,width=')
                             img_html += (
                                 f'<video class="preview-media" data-sampleimg="true" {playback} muted playsinline onclick="openImageViewer(\'{escape(video_url)}\', \'video\')">'
@@ -1184,6 +1231,7 @@ def update_model_info(model_string=None, model_version=None, only_html=False, in
                             meta_button = False
                             prompt_dict = {}
                         else:
+                            image_url = apply_thumbnail_format(image_url, width=pic.get('width') or None)
                             img_html += (
                                 f'<img class="preview-media" data-sampleimg="true" src="{image_url}" alt="Model preview" onclick="openImageViewer(\'{escape(image_url)}\', \'image\')">'
                             )

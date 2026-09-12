@@ -151,7 +151,7 @@ def delete_associated_files(directory, base_name):
     """Deletes related model files in the save directory"""
     # Patterns for associated files
     associated_suffixes = ['', '.preview', '.api_info', '.html']
-    image_exts = {'.png', '.jpg', '.jpeg'}
+    image_exts = {'.png', '.jpg', '.jpeg', '.webp'}
 
     for file in os.listdir(directory):
         file_path = os.path.join(directory, file)
@@ -179,8 +179,11 @@ def delete_associated_files(directory, base_name):
                     print(f"Image deleted: {file_path}")
 
 
-def _resize_image_bytes(image_bytes, target_size=512):
+def _resize_image_bytes(image_bytes, target_size=512, fmt=None):
     """Resize image bytes to target_size on the longer side, keeping aspect ratio"""
+    fmt = (fmt or _api.thumbnail_format()).upper()
+    if fmt == 'JPG':
+        fmt = 'JPEG'
     image = Image.open(io.BytesIO(image_bytes))
     width, height = image.size
 
@@ -190,11 +193,14 @@ def _resize_image_bytes(image_bytes, target_size=512):
         new_size = (int(width * target_size / height), target_size)
 
     resized_image = image.resize(new_size, Image.LANCZOS)
+    if fmt == 'WEBP' and resized_image.mode not in ('RGB', 'RGBA'):
+        resized_image = resized_image.convert('RGBA' if 'A' in resized_image.getbands() else 'RGB')
 
     output = io.BytesIO()
-    resized_image.save(output, format="PNG")
+    save_kw = {'quality': 85} if fmt == 'WEBP' else {}
+    resized_image.save(output, format=fmt, **save_kw)
     output.seek(0)
-    return output.getvalue()  # Return bytes, not BytesIO object
+    return output.getvalue()
 
 def save_preview(file_path, api_response, overwrite_toggle=False, sha256=None):
     proxies, ssl = _api.get_proxies()
@@ -202,7 +208,9 @@ def save_preview(file_path, api_response, overwrite_toggle=False, sha256=None):
     install_path = file_path.parent
     name = file_path.stem
     json_file = file_path.with_suffix('.json')
-    image_path = install_path / f"{name}.preview.png"
+    ext = _api.thumbnail_format()
+    image_path = install_path / f"{name}.preview.{ext}"
+    other_preview = install_path / f"{name}.preview.{'png' if ext == 'webp' else 'webp'}"
 
     if not overwrite_toggle and image_path.exists():
         return
@@ -220,7 +228,7 @@ def save_preview(file_path, api_response, overwrite_toggle=False, sha256=None):
                 if file_entry['hashes'].get('SHA256') == sha256:
                     for image in version['images']:
                         if image['type'] == 'image':
-                            url_with_width = re.sub(r'/width=\d+', f"/width={image['width']}", image['url'])
+                            url_with_width = _api.apply_thumbnail_format(image['url'], width=image.get('width'))
                             response = requests.get(url_with_width, proxies=proxies, verify=ssl)
 
                             if response.status_code == 200:
@@ -228,7 +236,7 @@ def save_preview(file_path, api_response, overwrite_toggle=False, sha256=None):
                                 resize_saved = getattr(opts, 'resize_preview_on_save', True)
                                 if resize_saved:
                                     resize_size = getattr(opts, 'resize_preview_size', 512)
-                                    image_data = _resize_image_bytes(response.content, resize_size)
+                                    image_data = _resize_image_bytes(response.content, resize_size, ext)
                                 else:
                                     # Save original size
                                     image_data = response.content
@@ -241,6 +249,12 @@ def save_preview(file_path, api_response, overwrite_toggle=False, sha256=None):
                                         sd_image_encryption.EncryptedImage.from_image(img).save(image_path)
                                 else:
                                     image_path.write_bytes(image_data)
+
+                                if overwrite_toggle and other_preview.exists():
+                                    try:
+                                        other_preview.unlink()
+                                    except OSError:
+                                        pass
 
                                 print(f"Preview saved at: {image_path}")
                             else:
@@ -287,10 +301,12 @@ def save_images(preview_html, model_filename, install_path, sub_folder, api_resp
 
     name = os.path.splitext(model_filename)[0]
     proxies, ssl = _api.get_proxies()
+    ext = _api.thumbnail_format()
+    pil_fmt = 'WEBP' if ext == 'webp' else 'PNG'
 
     downloaded_count = 0
     for i, raw_url in enumerate(img_urls):
-        filename = f"{name}_{i}.png"
+        filename = f"{name}_{i}.{ext}"
         img_url = quote(raw_url, safe=':/=')
         try:
             response = requests.get(img_url, proxies=proxies, verify=ssl, timeout=30)
@@ -300,7 +316,7 @@ def save_images(preview_html, model_filename, install_path, sub_folder, api_resp
             resize_saved = getattr(opts, 'resize_preview_on_save', True)
             if resize_saved:
                 resize_size = getattr(opts, 'resize_preview_size', 512)
-                image_data = _resize_image_bytes(image_data, resize_size)
+                image_data = _resize_image_bytes(image_data, resize_size, ext)
 
             img = Image.open(io.BytesIO(image_data))
 
@@ -317,9 +333,9 @@ def save_images(preview_html, model_filename, install_path, sub_folder, api_resp
                 if not all(key in imginfo for key in ['Encrypt', 'EncryptPwdSha']):
                     sd_image_encryption.EncryptedImage.from_image(img).save(save_path)
                 else:
-                    img.save(save_path, 'PNG')
+                    img.save(save_path, pil_fmt, **({'quality': 85} if pil_fmt == 'WEBP' else {}))
             else:
-                img.save(save_path, 'PNG')
+                img.save(save_path, pil_fmt, **({'quality': 85} if pil_fmt == 'WEBP' else {}))
 
             print(f"Downloaded image: {filename}")
             downloaded_count += 1
@@ -752,9 +768,10 @@ def save_model_info(install_path, file_name, sub_folder, sha256=None, preview_ht
     if preview_html and save_html_on_save:
         if use_local:
             img_urls = re.findall(r"data-sampleimg='true' src=[\'\"]?([^\'\" >]+)", preview_html)
+            ext = _api.thumbnail_format()
             for i, img_url in enumerate(img_urls):
                 debug_print(img_url)
-                img_name = f'{filename}_{i}.png'
+                img_name = f'{filename}_{i}.{ext}'
                 preview_html = preview_html.replace(img_url, f"{os.path.join(image_path, img_name)}")
 
         match = re.search(r'(\s*)<div class="main-container">', preview_html)

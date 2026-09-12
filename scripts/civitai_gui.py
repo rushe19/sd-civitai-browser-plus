@@ -1177,6 +1177,18 @@ def on_ui_settings():
     )
 
     shared.opts.add_option(
+        'civitai_thumbnail_format',
+        shared.OptionInfo(
+            default='webp',
+            label='Thumbnail image format',
+            component=gr.Radio,
+            component_args={'choices': ['webp', 'png']},
+            section=browser,
+            category_id=cat_id
+        ).info('CDN and local save format for thumbnails / .preview files. WebP is much smaller; PNG uses the original image')
+    )
+
+    shared.opts.add_option(
         'model_desc_to_json',
         shared.OptionInfo(
             default=False,
