@@ -4,6 +4,7 @@ import platform
 import json
 import os
 import re
+import time
 import gradio as gr
 from datetime import datetime, timezone
 from collections import defaultdict
@@ -653,6 +654,7 @@ def initial_model_page(content_type=None, sort_type=None, period_type=None, use_
         current_page = 1
     gl.previous_inputs = current_inputs
 
+    response = None
     if not from_update_tab:
         gl.from_update_tab = False
 
@@ -660,28 +662,64 @@ def initial_model_page(content_type=None, sort_type=None, period_type=None, use_
             # Handle SHA256 search specially
             if use_search_term == 'SHA256' and search_term:
                 debug_print(f"Performing SHA256 search for hash: {search_term}")
-                gl.json_data = _search_by_sha256(search_term)
-                gl.url_list = {1: f"sha256_search_{search_term.strip().upper()}" if isinstance(gl.json_data, dict) else 'error'}
+                response = _search_by_sha256(search_term)
+                if isinstance(response, dict):
+                    gl.json_data = response
+                    gl.url_list = {1: f"sha256_search_{search_term.strip().upper()}"}
+                else:
+                    gl.url_list = {1: 'error'}
+                    gl.json_data = response
             else:
                 api_url = create_api_url(content_type, sort_type, period_type, use_search_term, base_filter, only_liked, tile_count, search_term, nsfw, exact_search)
                 gl.url_list = {1: api_url}
-                gl.json_data = request_civit_api(api_url)
+                response = request_civit_api(api_url)
+                if isinstance(response, dict):
+                    gl.json_data = response
+                else:
+                    gl.json_data = response
         else:
             api_url = gl.url_list.get(current_page)
+            if api_url and not api_url.startswith('sha256_search_'):
+                response = request_civit_api(api_url)
+                if isinstance(response, dict):
+                    gl.json_data = response
+            else:
+                response = 'error'
     else:
         api_url = gl.url_list.get(current_page)
         gl.from_update_tab = True
         if api_url and not api_url.startswith('sha256_search_'):
-            gl.json_data = request_civit_api(api_url)
+            response = request_civit_api(api_url)
+            if isinstance(response, dict):
+                gl.json_data = response
+            else:
+                gl.json_data = response
+        else:
+            response = 'error'
 
-    max_page = 1
+    max_page = max(gl.url_list.keys()) if gl.url_list else 1
+    if max_page < current_page:
+        max_page = current_page
     model_list = []
     hasPrev, hasNext = False, False
 
-    if not isinstance(gl.json_data, dict):
-        HTML = api_error_msg(gl.json_data)
+    if not isinstance(response, dict):
+        HTML = api_error_msg(response)
+        hasPrev = current_page > 1
+        hasNext = True
+        
+        # Populate model_list from existing gl.json_data if available
+        if isinstance(gl.json_data, dict) and 'items' in gl.json_data:
+            for item in gl.json_data['items']:
+                if len(item.get('modelVersions', [])) > 0:
+                    model_list.append(f"{item['name']} ({item['id']})")
     else:
-        gl.json_data = insert_metadata(1)
+        gl.json_data = fill_model_page(insert_metadata(current_page), tile_count)
+        # The v1 API ignores sort/period when a search term is used, so the
+        # selected sort has to be applied to the fetched items client-side.
+        if (use_search_term and use_search_term != 'None' and search_term
+                and isinstance(gl.json_data, dict) and isinstance(gl.json_data.get('items'), list)):
+            gl.json_data['items'] = sort_search_results(gl.json_data['items'], sort_type)
 
         metadata = gl.json_data['metadata']
         hasNext = 'nextPage' in metadata
@@ -728,19 +766,33 @@ def next_model_page(content_type, sort_type, period_type, use_search_term, searc
         return initial_model_page(content_type, sort_type, period_type, use_search_term, search_term, current_page, base_filter, only_liked, nsfw, exact_search, tile_count)
 
     api_url = create_api_url(isNext=isNext)
-    gl.json_data = request_civit_api(api_url)
+    response = request_civit_api(api_url)
 
     next_page = current_page
     model_list = []
-    max_page = 1
+    max_page = max(gl.url_list.keys()) if gl.url_list else 1
     hasPrev, hasNext = False, False
 
-    if not isinstance(gl.json_data, dict):
-        HTML = api_error_msg(gl.json_data)
+    if not isinstance(response, dict):
+        HTML = api_error_msg(response)
+        hasPrev = current_page > 1
+        hasNext = True
+        
+        # Populate model_list from existing gl.json_data if available
+        if isinstance(gl.json_data, dict) and 'items' in gl.json_data:
+            for item in gl.json_data['items']:
+                if len(item.get('modelVersions', [])) > 0:
+                    model_list.append(f"{item['name']} ({item['id']})")
     else:
+        gl.json_data = response
         next_page = current_page + 1 if isNext else current_page - 1
 
-        gl.json_data = insert_metadata(next_page, api_url)
+        gl.json_data = fill_model_page(insert_metadata(next_page, api_url), tile_count)
+        # The v1 API ignores sort/period when a search term is used, so the
+        # selected sort has to be applied to the fetched items client-side.
+        if (use_search_term and use_search_term != 'None' and search_term
+                and isinstance(gl.json_data, dict) and isinstance(gl.json_data.get('items'), list)):
+            gl.json_data['items'] = sort_search_results(gl.json_data['items'], sort_type)
 
         metadata = gl.json_data['metadata']
         hasNext = 'nextPage' in metadata
@@ -787,6 +839,83 @@ def insert_metadata(page_nr, api_url=None):
         gl.url_list[page_nr] = api_url
 
     return gl.json_data
+
+## === ANXETY EDITs ===
+def sort_search_results(items, sort_type):
+    """Sort search results client-side.
+
+    The CivitAI v1 API ignores the 'sort' (and 'period') parameters when a
+    search query/username/tag is set and always returns relevance order,
+    so the selected sort has to be applied to the fetched items here."""
+    if not items or not sort_type:
+        return items
+    st = str(sort_type).strip().lower()
+
+    def stat(item, key):
+        return (item.get('stats') or {}).get(key) or 0
+
+    def created(item):
+        dates = [v.get('publishedAt') or '' for v in item.get('modelVersions') or []]
+        return min([d for d in dates if d], default='')
+
+    sorters = {
+        'newest': (created, True),
+        'oldest': (created, False),
+        'most downloaded': (lambda i: stat(i, 'downloadCount'), True),
+        'most liked': (lambda i: stat(i, 'thumbsUpCount'), True),
+        'most discussed': (lambda i: stat(i, 'commentCount'), True),
+    }
+    entry = sorters.get(st)
+    if entry:
+        key, reverse = entry
+        return sorted(items, key=key, reverse=reverse)
+    # Highest Rated / Most Collected / Most Buzz are not exposed in the v1
+    # API stats payload; keep the API's relevance order for those.
+    return items
+
+def fill_model_page(json_data, tile_count=None, max_api_pages=20):
+    """Fill a UI page until it has at least tile_count models.
+
+    The CivitAI v1 search API paginates with a cursor that advances by the
+    full page size even when query/baseModels filters make pages sparse
+    (e.g. limit=27 can return only 1-3 items per page while advancing the
+    cursor by 27). Without this, each UI page showed far fewer models than
+    the CivitAI web search. Keep fetching 'nextPage' and merge items until
+    the tile count is reached or results run out, and point 'nextPage' at
+    the first API page not yet consumed so pagination stays in sync."""
+    if not isinstance(json_data, dict) or 'items' not in json_data:
+        return json_data
+
+    try:
+        target = int(tile_count)
+    except (TypeError, ValueError):
+        target = 27
+    target = max(target, 1)
+
+    metadata = json_data.get('metadata')
+    if not isinstance(metadata, dict):
+        metadata = json_data['metadata'] = {}
+
+    items = json_data['items']
+    pages_fetched = 1
+    while len(items) < target and pages_fetched < max_api_pages:
+        next_url = metadata.get('nextPage')
+        if not next_url:
+            break
+        response = request_civit_api(next_url)
+        if not isinstance(response, dict) or 'items' not in response:
+            # Keep what we have; leave nextPage pointing at the failed page
+            # so pressing Next again retries it.
+            break
+        items.extend(response['items'])
+        pages_fetched += 1
+        next_metadata = response.get('metadata') or {}
+        if 'nextPage' in next_metadata:
+            metadata['nextPage'] = next_metadata['nextPage']
+        else:
+            metadata.pop('nextPage', None)
+
+    return json_data
 
 ## === ANXETY EDITs ===
 def update_model_versions(model_id, json_input=None):
@@ -1593,44 +1722,56 @@ def get_headers(referer=None, no_api=None):
 def request_civit_api(api_url=None, skip_error_check=False):
     headers = get_headers()
     proxies, ssl = get_proxies()
-    try:
-        response = requests.get(api_url, headers=headers, timeout=(60, 30), proxies=proxies, verify=ssl)
-        if not response.text or response.text.strip() == '':
-            print(f"CivitAI API returned empty response for: {api_url}")
-            return 'error'
+    # The CivitAI API intermittently answers search requests with 503 or
+    # timeouts; since filling one UI page can now require several paged
+    # requests, retry transient failures before giving up.
+    max_attempts = 4
+    for attempt in range(max_attempts):
+        try:
+            response = requests.get(api_url, headers=headers, timeout=(60, 30), proxies=proxies, verify=ssl)
+            if not response.text or response.text.strip() == '':
+                print(f"CivitAI API returned empty response for: {api_url}")
+                return 'error'
 
-        if skip_error_check:
+            if skip_error_check:
+                response.encoding = 'utf-8'
+                try:
+                    data = json.loads(response.text)
+                    return data
+                except json.JSONDecodeError as e:
+                    print(f"CivitAI API: JSON decode error - {e}")
+                    return 'error'
+
+            response.raise_for_status()
             response.encoding = 'utf-8'
             try:
                 data = json.loads(response.text)
-                return data
-            except json.JSONDecodeError as e:
-                print(f"CivitAI API: JSON decode error - {e}")
+            except json.JSONDecodeError:
+                print(response.text)
+                print('The CivitAI servers are currently offline. Please try again later.')
+                return 'offline'
+            return data
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 404:
+                print(f"Model version not found (404): {api_url}")
+                return 'not_found'
+            elif e.response.status_code in (429, 500, 502, 503, 504) and attempt < max_attempts - 1:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            else:
+                print(f"HTTP Error {e.response.status_code}: {e}")
                 return 'error'
-
-        response.raise_for_status()
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 404:
-            print(f"Model version not found (404): {api_url}")
-            return 'not_found'
-        else:
-            print(f"HTTP Error {e.response.status_code}: {e}")
+        except requests.exceptions.Timeout:
+            if attempt < max_attempts - 1:
+                print('The request timed out. Retrying...')
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            print('The request timed out. Please try again later.')
+            return 'timeout'
+        except requests.exceptions.RequestException as e:
+            print(f"Error: {e}")
             return 'error'
-    except requests.exceptions.Timeout as e:
-        print('The request timed out. Please try again later.')
-        return 'timeout'
-    except requests.exceptions.RequestException as e:
-        print(f"Error: {e}")
-        return 'error'
-    else:
-        response.encoding = 'utf-8'
-        try:
-            data = json.loads(response.text)
-        except json.JSONDecodeError:
-            print(response.text)
-            print('The CivitAI servers are currently offline. Please try again later.')
-            return 'offline'
-    return data
+    return 'error'
 
 ## === ANXETY EDITs ===
 def api_error_msg(input_string):
