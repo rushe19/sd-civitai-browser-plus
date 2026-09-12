@@ -66,9 +66,6 @@ def all_visible(html_check):
     # Show the button only if there are 2 or more checkboxes (more than 1 model to select)
     return gr.Button.update(visible=checkbox_count >= 2)
 
-def HTMLChange(input):
-    return gr.HTML.update(value=input)
-
 def show_multi_buttons(model_list, type_list, version_value):
     model_list = json.loads(model_list)
     type_list = json.loads(type_list)
@@ -287,25 +284,17 @@ def on_ui_tabs():
                 load_to_browser_installed = gr.Button(value='Load installed models to browser', interactive=False, visible=False)
             with gr.Row():
                 installed_progress = gr.HTML(value='<div style="min-height: 0px;"></div>')
-            with gr.Row():
-                organize_models = gr.Button(value='Organize model files', interactive=True, visible=False) # Organize models hidden until implemented
-                cancel_organize = gr.Button(value='Cancel loading models', interactive=False, visible=False)
-            with gr.Row():
-                organize_progress = gr.HTML(value='<div style="min-height: 0px;"></div>')
 
         ## Queue Tab
         with gr.Tab(label='Download Queue', elem_id='queueTab'):
 
-            def get_style(size, left_border):
-                return f"flex-grow: {size};" + ('border-left: 1px solid var(--border-color-primary);' if left_border else '') + 'border-bottom: 1px solid var(--border-color-primary);padding: 5px 10px 5px 10px;width: 0;'
-
             download_manager_html = gr.HTML(elem_id='civitai_dl_list', value=f'''
                 <div style="display: flex;font-size: var(--section-header-text-size);border: 1px solid transparent;">
-                <div style="{get_style(1, False)}"><span>Model:</span></div>
-                <div style="{get_style(0.75, True)}"><span>Version:</span></div>
-                <div style="{get_style(1.5, True)}"><span>Path:</span></div>
-                <div style="{get_style(1.5, True)}"><span>Status:</span></div>
-                <div style="{get_style(0.3, True)}"><span>Action:</span></div>
+                <div style="{_download.get_style(1, False)}"><span>Model:</span></div>
+                <div style="{_download.get_style(0.75, True)}"><span>Version:</span></div>
+                <div style="{_download.get_style(1.5, True)}"><span>Path:</span></div>
+                <div style="{_download.get_style(1.5, True)}"><span>Status:</span></div>
+                <div style="{_download.get_style(0.3, True)}"><span>Action:</span></div>
                 </div>
                 <div class="civitai_nonqueue_list">
                 </div>
@@ -358,8 +347,6 @@ def on_ui_tabs():
         ver_finish = gr.Textbox(visible=False)
         installed_start = gr.Textbox(visible=None)
         installed_finish = gr.Textbox(visible=None)
-        organize_start = gr.Textbox(visible=None)
-        organize_finish = gr.Textbox(visible=None)
         delete_finish = gr.Textbox(visible=False)
         current_model = gr.Textbox(visible=False)
         current_sha256 = gr.Textbox(visible=False)
@@ -408,9 +395,9 @@ def on_ui_tabs():
 
         # Filter button Functions #
 
-        queue_html_input.change(fn=HTMLChange, inputs=[queue_html_input], outputs=download_manager_html)
-        list_html_input.change(fn=HTMLChange, inputs=[list_html_input], outputs=list_html)
-        preview_html_input.change(fn=HTMLChange, inputs=[preview_html_input], outputs=preview_html)
+        queue_html_input.change(fn=lambda v: gr.HTML.update(value=v), inputs=[queue_html_input], outputs=download_manager_html)
+        list_html_input.change(fn=lambda v: gr.HTML.update(value=v), inputs=[list_html_input], outputs=list_html)
+        preview_html_input.change(fn=lambda v: gr.HTML.update(value=v), inputs=[preview_html_input], outputs=preview_html)
 
         remove_dl_id.change(
             fn=_download.remove_from_queue,
@@ -902,7 +889,6 @@ def on_ui_tabs():
                 load_installed,
                 save_all_tags,
                 update_preview,
-                organize_models,
                 version_progress
             ]
         )
@@ -923,7 +909,6 @@ def on_ui_tabs():
                 save_all_tags,
                 load_installed,
                 update_preview,
-                organize_models,
                 cancel_ver_search,
                 load_to_browser_outdated
             ]
@@ -939,7 +924,6 @@ def on_ui_tabs():
                 ver_search,
                 save_all_tags,
                 update_preview,
-                organize_models,
                 installed_progress
             ]
         )
@@ -960,7 +944,6 @@ def on_ui_tabs():
                 save_all_tags,
                 load_installed,
                 update_preview,
-                organize_models,
                 cancel_installed,
                 load_to_browser_installed
             ]
@@ -976,7 +959,6 @@ def on_ui_tabs():
                 load_installed,
                 ver_search,
                 update_preview,
-                organize_models,
                 tag_progress
             ]
         )
@@ -997,7 +979,6 @@ def on_ui_tabs():
                 save_all_tags,
                 load_installed,
                 update_preview,
-                organize_models,
                 cancel_all_tags
             ]
         )
@@ -1012,7 +993,6 @@ def on_ui_tabs():
                 load_installed,
                 ver_search,
                 save_all_tags,
-                organize_models,
                 preview_progress
             ]
         )
@@ -1033,43 +1013,6 @@ def on_ui_tabs():
                 save_all_tags,
                 load_installed,
                 update_preview,
-                organize_models,
-                cancel_update_preview
-            ]
-        )
-
-        organize_models.click(
-            fn=_file.organize_start,
-            inputs=[organize_start],
-            outputs=[
-                organize_start,
-                organize_models,
-                cancel_organize,
-                load_installed,
-                ver_search,
-                save_all_tags,
-                update_preview,
-                organize_progress
-            ]
-        )
-
-        organize_start.change(
-            fn=_file.file_scan,
-            inputs=file_scan_inputs,
-            outputs=[
-                organize_progress,
-                organize_finish
-            ]
-        )
-
-        organize_finish.change(
-            fn=_file.save_preview_finish,
-            outputs=[
-                ver_search,
-                save_all_tags,
-                load_installed,
-                update_preview,
-                organize_models,
                 cancel_update_preview
             ]
         )

@@ -1,16 +1,13 @@
-import urllib.request
-import urllib.error
 import requests
 import hashlib
 import base64
-import errno
 import json
 import time
 import re
 import os
 import io
 import gradio as gr
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 from pathlib import Path
 from PIL import Image
 
@@ -19,7 +16,6 @@ from modules.shared import cmd_opts, opts
 
 # === Extension imports ===
 import scripts.civitai_download as _download
-import scripts.civitai_file_manage as _file
 import scripts.civitai_global as gl
 import scripts.civitai_api as _api
 from scripts.civitai_global import print, debug_print
@@ -63,7 +59,7 @@ def delete_model(delete_finish=None, model_filename=None, model_string=None, lis
     else:
         model_versions = model_ver
 
-    (model_name, ver_value, ver_choices) = _file.card_update(model_versions, model_string, list_versions, False)
+    (model_name, ver_value, ver_choices) = card_update(model_versions, model_string, list_versions, False)
     if not model_json:
         if model_id != None:
             selected_content_type = None
@@ -290,53 +286,46 @@ def save_images(preview_html, model_filename, install_path, sub_folder, api_resp
     img_urls = img_urls[:img_count]
 
     name = os.path.splitext(model_filename)[0]
+    proxies, ssl = _api.get_proxies()
 
-    # Setup download
-    opener = urllib.request.build_opener()
-    opener.addheaders = [('User-agent', 'Mozilla/5.0')]
-    urllib.request.install_opener(opener)
-
-    # Download images
     downloaded_count = 0
-    for i, img_url in enumerate(img_urls):
+    for i, raw_url in enumerate(img_urls):
         filename = f"{name}_{i}.png"
-        img_url = urllib.parse.quote(img_url, safe=':/=')
+        img_url = quote(raw_url, safe=':/=')
         try:
-            with urllib.request.urlopen(img_url) as url:
-                image_data = url.read()
+            response = requests.get(img_url, proxies=proxies, verify=ssl, timeout=30)
+            response.raise_for_status()
+            image_data = response.content
 
-                # Check if resize is enabled for saved images
-                resize_saved = getattr(opts, 'resize_preview_on_save', True)
-                if resize_saved:
-                    resize_size = getattr(opts, 'resize_preview_size', 512)
-                    image_data = _resize_image_bytes(image_data, resize_size)
+            resize_saved = getattr(opts, 'resize_preview_on_save', True)
+            if resize_saved:
+                resize_size = getattr(opts, 'resize_preview_size', 512)
+                image_data = _resize_image_bytes(image_data, resize_size)
 
-                img = Image.open(io.BytesIO(image_data))
+            img = Image.open(io.BytesIO(image_data))
 
-                if img.mode in ('RGBA', 'LA', 'P'):
-                    pass  # Keep transparency
-                elif img.mode != 'RGB':
-                    img = img.convert('RGB')
+            if img.mode in ('RGBA', 'LA', 'P'):
+                pass
+            elif img.mode != 'RGB':
+                img = img.convert('RGB')
 
-                save_path = os.path.join(image_path, filename)
+            save_path = os.path.join(image_path, filename)
 
-                if IS_KAGGLE:
-                    import sd_image_encryption
-                    imginfo = img.info or {}
-                    if not all(key in imginfo for key in ['Encrypt', 'EncryptPwdSha']):
-                        sd_image_encryption.EncryptedImage.from_image(img).save(save_path)
-                    else:
-                        img.save(save_path, 'PNG')
+            if IS_KAGGLE:
+                import sd_image_encryption
+                imginfo = img.info or {}
+                if not all(key in imginfo for key in ['Encrypt', 'EncryptPwdSha']):
+                    sd_image_encryption.EncryptedImage.from_image(img).save(save_path)
                 else:
                     img.save(save_path, 'PNG')
+            else:
+                img.save(save_path, 'PNG')
 
-                print(f"Downloaded image: {filename}")
-                downloaded_count += 1
+            print(f"Downloaded image: {filename}")
+            downloaded_count += 1
 
-        except urllib.error.URLError as e:
-            print(f"Error downloading {filename}: {e.reason}")
         except Exception as e:
-            print(f"Error processing image {filename}: {e}")
+            print(f"Error downloading {filename}: {e}")
 
     if downloaded_count > 0:
         print(f"Successfully downloaded {downloaded_count} images to: {image_path}")
@@ -733,22 +722,7 @@ def clean_description(desc):
     return cleaned_text.strip()
 
 def make_dir(path):
-    try:
-        if not os.path.exists(path):
-            os.makedirs(path)
-    except OSError as e:
-        if e.errno == errno.EACCES:
-            try:
-                os.makedirs(path, mode=0o777)
-            except OSError as e2:
-                if e2.errno == errno.EACCES:
-                    print('Permission denied even with elevated permissions.')
-                else:
-                    print(f"Error creating directory: {e2}")
-        else:
-            print(f"Error creating directory: {e}")
-    except Exception as e:
-        print(f"Error creating directory: {e}")
+    Path(path).mkdir(parents=True, exist_ok=True)
 
 ## === ANXETY EDITs ===
 def save_model_info(install_path, file_name, sub_folder, sha256=None, preview_html=None, overwrite_toggle=False, api_response=None):
@@ -1000,126 +974,67 @@ def extract_version_from_ver_name(filename):
     return None, []
 
 def compare_version_parts(a_parts, b_parts):
-    """
-    Compare two version parts lists.
-    Returns:
-      -1 if a < b,
-      0 if a == b,
-      1 if a > b
-    """
     max_len = max(len(a_parts), len(b_parts))
     a = a_parts + [0] * (max_len - len(a_parts))
     b = b_parts + [0] * (max_len - len(b_parts))
     return (a > b) - (a < b)
 
-def version_match(file_paths, api_response, log=False):
-    """
-    Checking model updates by version.
-    - If opts.precise_version_check = False:
-        Compares only versions (without families).
-    - If True:
-        Compares versions by family, if family exists.
-        If family=None — switches to comparison without family.
-    """
+def has_outdated_versions(installed_map, installed_all, available_map, available_all, precise_check=True):
+    def outdated(inst, avail):
+        max_inst = max(inst, key=lambda x: x or [0])
+        max_avail = max(avail, key=lambda x: x or [0])
+        return compare_version_parts(max_inst, max_avail) < 0
+
+    if precise_check and available_map:
+        return any(
+            inst and outdated(inst, avail)
+            for fam, avail in available_map.items()
+            if (inst := installed_map.get(fam))
+        )
+    return bool(installed_all and available_all and outdated(installed_all, available_all))
+
+def version_match(file_paths, api_response):
     precise_check = getattr(opts, 'precise_version_check', True)
     updated_models = []
     outdated_models = []
 
-    # === 1. Collecting installed SHA256 ===
     installed_hashes = set()
     for path in file_paths:
-        json_path = f"{os.path.splitext(path)[0]}.json"
-        data = _api.safe_json_load(json_path)
-        if data:
-            sha = data.get('sha256', '')
-            if sha:
-                installed_hashes.add(sha.upper())
+        data = _api.safe_json_load(f"{os.path.splitext(path)[0]}.json")
+        if data and (sha := data.get('sha256', '')):
+            installed_hashes.add(sha.upper())
 
-    if log:
-        print(f"[LOG] {len(installed_hashes)} installed model hashes found")
-
-    # === 2. Determine installed versions and families ===
-    installed_map = {}  # family -> list of versions
-    installed_all = []  # all versions regardless of family
-
+    installed_map, installed_all = {}, []
     for model in api_response.get('items', []):
         for ver in model.get('modelVersions', []):
-            ver_name = ver.get('name', '')
-            family, ver_parts = extract_version_from_ver_name(ver_name)
-
+            family, ver_parts = extract_version_from_ver_name(ver.get('name', ''))
             for file_entry in ver.get('files', []):
                 sha = file_entry.get('hashes', {}).get('SHA256', '').upper()
                 if sha in installed_hashes:
                     if precise_check and family:
                         installed_map.setdefault(family, []).append(ver_parts)
-                        if log:
-                            print(f"[LOG] Family '{family}' version {ver_parts} is installed")
                     else:
                         installed_all.append(ver_parts)
-                        if log:
-                            print(f"[LOG] Version {ver_parts} is installed (without family)")
                     break
 
-    # === 3. Compare with available versions ===
     for model in api_response.get('items', []):
-        model_id = model.get('id')
-        model_name = model.get('name')
         model_versions = model.get('modelVersions', [])
-
         if not model_versions:
             continue
 
-        available_map = {}  # dictionary: { family_name: [list of versions] } — all versions grouped by family
-        available_all = []  # list of all versions without grouping by family (used if precise_check=False)
-
+        available_map, available_all = {}, []
         for ver in model_versions:
-            ver_name = ver.get('name', '')
-            family, ver_parts = extract_version_from_ver_name(ver_name)
-
+            family, ver_parts = extract_version_from_ver_name(ver.get('name', ''))
             if precise_check and family:
                 available_map.setdefault(family, []).append(ver_parts)
             else:
                 available_all.append(ver_parts)
 
-        has_outdated = False
-
-        if precise_check and available_map:
-            # Сomparison by families
-            for fam_key, avail_versions in available_map.items():
-                installed_versions = installed_map.get(fam_key, [])
-                if not installed_versions:
-                    continue
-
-                max_inst = max(installed_versions, key=lambda x: x or [0])
-                max_avail = max(avail_versions, key=lambda x: x or [0])
-                cmp = compare_version_parts(max_inst, max_avail)
-
-                if cmp < 0:
-                    has_outdated = True
-                    if log:
-                        print(f"[LOG] '{model_name}' family '{fam_key}': outdated ({max_inst} < {max_avail})")
-                elif log:
-                    print(f"[LOG] '{model_name}' family '{fam_key}': up-to-date ({max_inst} >= {max_avail})")
-
+        entry = (f"&ids={model.get('id')}", model.get('name'))
+        if has_outdated_versions(installed_map, installed_all, available_map, available_all, precise_check):
+            outdated_models.append(entry)
         else:
-            # Сomparison without families
-            if not installed_all:
-                continue
-            max_inst = max(installed_all, key=lambda x: x or [0])
-            max_avail = max(available_all, key=lambda x: x or [0])
-            cmp = compare_version_parts(max_inst, max_avail)
-
-            if cmp < 0:
-                has_outdated = True
-                if log:
-                    print(f"[LOG] '{model_name}': outdated ({max_inst} < {max_avail})")
-            elif log:
-                print(f"[LOG] '{model_name}': up-to-date ({max_inst} >= {max_avail})")
-
-        if has_outdated:
-            outdated_models.append((f"&ids={model_id}", model_name))
-        else:
-            updated_models.append((f"&ids={model_id}", model_name))
+            updated_models.append(entry)
 
     return updated_models, outdated_models
 
@@ -1139,7 +1054,7 @@ def get_save_path_and_name(install_path, file_name, api_response, sub_folder=Non
     name = os.path.splitext(file_name)[0]
     if not sub_folder:
         sub_folder = os.path.normpath(os.path.relpath(install_path, gl.main_folder))
-    image_path = _file.get_image_path(install_path, api_response, sub_folder)
+    image_path = get_image_path(install_path, api_response, sub_folder)
 
     if save_to_custom:
         save_path = image_path
@@ -1177,7 +1092,7 @@ def file_scan(folders, tag_finish, ver_finish, installed_finish, preview_finish,
 
     folders_to_check = []
     if 'All' in folders:
-        folders = _file.get_content_choices()
+        folders = get_content_choices()
 
     for item in folders:
         if item == 'LORA':
@@ -1456,7 +1371,6 @@ def finish_returns():
         gr.Button.update(interactive=True, visible=True),
         gr.Button.update(interactive=True, visible=True),
         gr.Button.update(interactive=True, visible=True),
-        gr.Button.update(interactive=True, visible=False),  # Organize models hidden until implemented
         gr.Button.update(interactive=False, visible=False)
     )
 
@@ -1468,68 +1382,50 @@ def start_returns(number):
         gr.Button.update(interactive=False, visible=True),
         gr.Button.update(interactive=False, visible=True),
         gr.Button.update(interactive=False, visible=True),
-        gr.Button.update(interactive=False, visible=False),  # Organize models hidden until implemented
         gr.HTML.update(value='<div style="min-height: 100px;"></div>')
     )
 
-## === ANXETY EDITs ===
-def set_globals(input_global=None):
-    global from_tag, from_ver, from_installed, from_preview, from_organize
-    from_tag = from_ver = from_installed = from_preview = from_organize = False
-    if input_global == 'reset':
-        return
-    elif input_global == 'from_tag':
+def set_globals(mode=None):
+    global from_tag, from_ver, from_installed, from_preview
+    from_tag = from_ver = from_installed = from_preview = False
+    if mode == 'from_tag':
         from_tag = True
-    elif input_global == 'from_ver':
+    elif mode == 'from_ver':
         from_ver = True
-    elif input_global == 'from_installed':
+    elif mode == 'from_installed':
         from_installed = True
-    elif input_global == 'from_preview':
+    elif mode == 'from_preview':
         from_preview = True
-    elif input_global == 'from_organize':
-        from_organize = True
+
+def _scan_start(trigger, mode):
+    set_globals(mode)
+    return start_returns(_download.random_number(trigger))
 
 def save_tag_start(tag_start):
-    set_globals('from_tag')
-    number = _download.random_number(tag_start)
-    return start_returns(number)
+    return _scan_start(tag_start, 'from_tag')
 
 def save_preview_start(preview_start):
-    set_globals('from_preview')
-    number = _download.random_number(preview_start)
-    return start_returns(number)
+    return _scan_start(preview_start, 'from_preview')
 
 def ver_search_start(ver_start):
-    set_globals('from_ver')
-    number = _download.random_number(ver_start)
-    return start_returns(number)
+    return _scan_start(ver_start, 'from_ver')
 
 def installed_models_start(installed_start):
-    set_globals('from_installed')
-    number = _download.random_number(installed_start)
-    return start_returns(number)
-
-def organize_start(organize_start):
-    set_globals('from_organize')
-    number = _download.random_number(organize_start)
-    return start_returns(number)
+    return _scan_start(installed_start, 'from_installed')
 
 def save_tag_finish():
-    set_globals('reset')
+    set_globals()
     return finish_returns()
 
-def save_preview_finish():
-    set_globals('reset')
-    return finish_returns()
+save_preview_finish = save_tag_finish
 
 def scan_finish():
-    set_globals('reset')
+    set_globals()
     return (
         gr.Button.update(interactive=no_update, visible=no_update),
         gr.Button.update(interactive=no_update, visible=no_update),
         gr.Button.update(interactive=no_update, visible=no_update),
         gr.Button.update(interactive=no_update, visible=no_update),
-        gr.Button.update(interactive=no_update, visible=False),
         gr.Button.update(interactive=False, visible=False),
         gr.Button.update(interactive=not no_update, visible=not no_update)
     )

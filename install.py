@@ -12,8 +12,6 @@ req_file = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'requiremen
 
 def dist2package(dist: str):
     return ({
-        # 'send2trash': 'send2trash',
-        'ZipUnicod': 'zip_unicode',
         'beautifulsoup4': 'bs4',
     }).get(dist, dist)
 

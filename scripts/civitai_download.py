@@ -8,6 +8,7 @@ import json
 import time
 import re
 import os
+import zipfile
 import gradio as gr
 from pathlib import Path
 
@@ -20,11 +21,6 @@ import scripts.civitai_global as gl
 import scripts.civitai_api as _api
 from scripts.civitai_api import is_early_access, is_model_nsfw
 from scripts.civitai_global import print, debug_print
-
-try:
-    from zip_unicode import ZipHandler
-except ImportError:
-    print('Python module "ZipUnicode" has not been imported correctly, please try to restart or install it manually.')
 
 
 total_count = 0
@@ -394,6 +390,56 @@ def convert_size(size):
         size /= 1024
     return f"{size:.2f} GB"
 
+def _extract_zip(zip_path, dest):
+    # ponytail: cp932 fallback for legacy JP Windows zips without UTF-8 flag
+    last_err = None
+    for encoding in (None, 'cp932'):
+        try:
+            with zipfile.ZipFile(zip_path, metadata_encoding=encoding) as zf:
+                names = zf.namelist()
+                zf.extractall(dest)
+                return names
+        except UnicodeError as e:
+            last_err = e
+    raise last_err or UnicodeError(f'Cannot decode zip names in {zip_path}')
+
+def _fail_download(msg, progress=None, fail=True):
+    print(msg)
+    gl.download_fail = fail
+    if progress is not None:
+        progress(0, desc=msg)
+        time.sleep(5)
+
+def prepare_download_link(url, model_id, file_name, progress=None):
+    """Resolve final download URL. Returns link or None (sets gl.download_fail)."""
+    gl.download_fail = False
+    for item in gl.download_queue:
+        if int(item.get('model_id', -1)) != int(model_id):
+            continue
+        items = item.get('model_json', {}).get('items', [])
+        if items and 'modelVersions' in items[0] and is_early_access(items[0]['modelVersions'][0]):
+            _fail_download(
+                f"File: '{file_name}' is marked as Early Access on CivitAI. You need to purchase this model to download it.",
+                progress, 'EARLY_ACCESS'
+            )
+            return None
+        break
+
+    download_link = get_download_link(url, model_id)
+    if not download_link:
+        _fail_download(
+            f"File: '{file_name}' not found on CivitAI servers, it looks like the file is not available for download.",
+            progress
+        )
+        return None
+    if download_link == 'NO_API':
+        _fail_download(
+            f"File: '{file_name}' requires a personal CivitAI API key to be downloaded, you can set your own API key in the CivitAI Browser+ settings in the SD-WebUI settings tab",
+            progress, 'NO_API'
+        )
+        return None
+    return download_link
+
 # === ANXETY EDIT ===
 def get_download_link(url, model_id):
     headers = _api.get_headers(model_id)
@@ -443,61 +489,21 @@ def download_file(url, file_path, install_path, model_id, progress=gr.Progress()
         disable_dns = getattr(opts, 'disable_dns', False)
         split_aria2 = getattr(opts, 'split_aria2', 64)
         max_retries = 5
-        gl.download_fail = False
         aria2_rpc_url = "http://localhost:24000/jsonrpc"
-
         file_name = os.path.basename(file_path)
 
-        ## === ANXETY EDITs ===
-        # Find the model item in the download queue (by model_id and file_name)
-        early_access = False
-        for item in gl.download_queue:
-            if int(item.get('model_id', -1)) == int(model_id):
-                model_json = item.get('model_json', {})
-                items = model_json.get('items', [])
-                if items and 'modelVersions' in items[0]:
-                    version = items[0]['modelVersions'][0]
-                    if is_early_access(version):
-                        early_access = True
-                break
-
-        if early_access:
-            msg = f"File: '{file_name}' is marked as Early Access on CivitAI. You need to purchase this model to download it."
-            print(msg)
-            gl.download_fail = 'EARLY_ACCESS'
-            if progress is not None:
-                progress(0, desc=msg)
-                time.sleep(5)
-            return
-
-        download_link = get_download_link(url, model_id)
+        download_link = prepare_download_link(url, model_id, file_name, progress)
         if not download_link:
-            msg = f"File: '{file_name}' not found on CivitAI servers, it looks like the file is not available for download."
-            print(msg)
-            gl.download_fail = True
-            return
-
-        elif download_link == 'NO_API':
-            msg = f"File: '{file_name}' requires a personal CivitAI API to be downloaded, you can set your own API key in the CivitAI Browser+ settings in the SD-WebUI settings tab"
-            print(msg)
-            gl.download_fail = 'NO_API'
-            if progress is not None:
-                progress(0, desc=msg)
-                time.sleep(5)
             return
 
         if os.path.exists(file_path):
             os.remove(file_path)
 
-        if disable_dns:
-            dns = 'false'
-        else:
-            dns = 'true'
-
+        dns = 'false' if disable_dns else 'true'
         options = {
             'dir': install_path,
-            'max-connection-per-server': str(f"{split_aria2}"),
-            'split': str(f"{split_aria2}"),
+            'max-connection-per-server': str(split_aria2),
+            'split': str(split_aria2),
             'async-dns': dns,
             'out': file_name
         }
@@ -606,35 +612,18 @@ def info_to_json(install_path, model_id, model_sha256, unpackList=None):
 
 def download_file_old(url, file_path, model_id, progress=gr.Progress() if queue else None):
     try:
-        gl.download_fail = False
         max_retries = 5
         if os.path.exists(file_path):
             os.remove(file_path)
 
         downloaded_size = 0
-        tokens = re.split(re.escape(os.sep), file_path)
-        file_name_display = tokens[-1]
+        file_name_display = os.path.basename(file_path)
         start_time = time.time()
         last_update_time = 0
         update_interval = 0.25
 
-        download_link = get_download_link(url, model_id)
+        download_link = prepare_download_link(url, model_id, file_name_display, progress)
         if not download_link:
-            msg = f"File: '{file_name_display}' not found on CivitAI servers, it looks like the file is not available for download."
-            print(msg)
-            if progress != None:
-                progress(0, desc=msg)
-                time.sleep(5)
-            gl.download_fail = True
-            return
-
-        elif download_link == 'NO_API':
-            msg = f"File: '{file_name_display}' requires a personal CivitAI API key to be downloaded, you can set your own API key in the CivitAI Browser+ settings in the SD-WebUI settings tab"
-            print(msg)
-            gl.download_fail = 'NO_API'
-            if progress != None:
-                progress(0, desc=msg)
-                time.sleep(5)
             return
 
         headers = _api.get_headers(model_id, True)
@@ -787,18 +776,9 @@ def download_create_thread(download_finish, queue_trigger, progress=gr_progress_
                 try:
                     if path_to_new_file.endswith('.zip'):
                         directory = Path(os.path.dirname(path_to_new_file))
-                        zip_handler = ZipHandler(path_to_new_file)
-
-                        for _, decoded_name in zip_handler.name_map.items():
-                            unpackList.append(decoded_name)
-
-                        zip_handler.extract_all(directory)
-                        zip_handler.zip_ref.close()
-
+                        unpackList = _extract_zip(path_to_new_file, directory)
                         print(f"Successfully extracted {item['model_filename']} to {directory}")
                         os.remove(path_to_new_file)
-                except ImportError:
-                    print('Python module "ZipUnicode" has not been imported correctly, cannot extract zip file. Please try to restart or install it manually.')
                 except Exception as e:
                     print(f"Failed to extract {item['model_filename']} with error: {e}")
             if not gl.cancel_status:

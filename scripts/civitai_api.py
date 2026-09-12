@@ -6,7 +6,7 @@ import os
 import re
 import time
 import gradio as gr
-from datetime import datetime, timezone
+from datetime import datetime
 from collections import defaultdict
 from pathlib import Path
 from html import escape
@@ -218,8 +218,7 @@ def contenttype_folder(content_type, desc=None, custom_folder=None):
     return None
 
 def model_list_html(json_data):
-    def filter_versions(item, hide_early_access, current_time):
-        """Filter model versions based on file presence and early access status"""
+    def filter_versions(item, hide_early_access):
         versions = []
         for version in item.get('modelVersions', []):
             if not version.get('files'):
@@ -323,10 +322,9 @@ def model_list_html(json_data):
         model_versions = item.get('modelVersions', [])
         if model_versions:
             precise_check = getattr(opts, 'precise_version_check', True)
-            installed_map, available_map = {}, {}  # family → list of version parts
-            installed_all, available_all = [], []  # all versions (no family grouping)
+            installed_map, available_map = {}, {}
+            installed_all, available_all = [], []
 
-            # --- Collect version and installation info ---
             for version in model_versions:
                 version_name = version.get('name', '')
                 family, version_parts = _file.extract_version_from_ver_name(version_name)
@@ -336,44 +334,18 @@ def model_list_html(json_data):
                 else:
                     available_all.append(version_parts)
 
-                # Check if any file of this version is installed
                 for file in version.get('files', []):
                     file_name = file['name'].lower()
                     file_sha256 = normalize_sha256(file.get('hashes', {}).get('SHA256', ''))
-                    name_match = file_name in existing_files
-                    sha_match = file_sha256 and file_sha256 in existing_files_sha256
-
-                    if sha_match or name_match:
+                    if file_name in existing_files or (file_sha256 and file_sha256 in existing_files_sha256):
                         if precise_check and family:
                             installed_map.setdefault(family, []).append(version_parts)
                         else:
                             installed_all.append(version_parts)
                         break
 
-            # Check installed
-            has_installed = bool(installed_map or installed_all)
-            if has_installed:
-                has_outdated = False
-
-                def is_outdated(inst, avail):
-                    """Compare max installed and available versions"""
-                    max_inst = max(inst, key=lambda x: x or [0])
-                    max_avail = max(avail, key=lambda x: x or [0])
-                    cmp = _file.compare_version_parts(max_inst, max_avail)
-                    return cmp < 0
-
-                # Comparison by families
-                if precise_check and available_map:
-                    for fam, avail in available_map.items():
-                        inst = installed_map.get(fam)
-                        if inst and is_outdated(inst, avail):
-                            has_outdated = True
-                            break
-                # Comparison without families
-                elif installed_all and available_all:
-                    has_outdated = is_outdated(installed_all, available_all)
-
-                if has_outdated:
+            if installed_map or installed_all:
+                if _file.has_outdated_versions(installed_map, installed_all, available_map, available_all, precise_check):
                     installstatus = 'civmodelcardoutdated'
                 else:
                     installstatus = 'civmodelcardinstalled'
@@ -452,12 +424,11 @@ def model_list_html(json_data):
     video_playback = getattr(opts, 'video_playback', True)
     playback = 'autoplay loop' if video_playback else ''
     hide_early_access = getattr(opts, 'hide_early_access', True)
-    current_time = datetime.now(timezone.utc)
 
     # Filter model versions and items
     filtered_items = []
     for item in json_data.get('items', []):
-        versions = filter_versions(item, hide_early_access, current_time)
+        versions = filter_versions(item, hide_early_access)
         if versions:
             item['modelVersions'] = versions
             filtered_items.append(item)
