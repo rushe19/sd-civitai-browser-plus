@@ -210,8 +210,16 @@ def contenttype_folder(content_type, desc=None, custom_folder=None):
 
     def resolve_path(attr, fallback):
         # Returns a Path from cmd_opts if set, otherwise fallback
-        if getattr(cmd_opts, attr, None) and not custom_folder:
-            return Path(getattr(cmd_opts, attr))
+        # Forge Neo parses --ckpt-dirs/--lora-dirs/--vae-dirs with action="append",
+        # so cmd_opts values for those are LISTS; Path(list) would raise TypeError
+        # (swallowed by the try/except below -> None -> os.path.join(None) crash on tile tap).
+        val = getattr(cmd_opts, attr, None)
+        if val and not custom_folder:
+            if isinstance(val, (list, tuple)):
+                if not val:
+                    return fallback
+                val = val[0]
+            return Path(val)
         return fallback
 
     # Mapping for content types
